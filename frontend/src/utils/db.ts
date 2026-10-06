@@ -20,7 +20,7 @@ import { nowDateTime, rescueMinutes, todayDate } from './duration';
 export const DB_NAME = 'gbelevsvc';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -88,6 +88,49 @@ class ElevatorServiceDatabase extends Dexie {
           if (row.result === undefined) row.result = null;
         });
       });
+
+    // v3：整改单补充来源（保养 / 救援 / 手动）与来源关联（rescueId / planId），
+    //     困人事件补充复盘整改单关联（rectifyId），支撑救援复盘沿用保养项与复用待整改单
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        elevators: 'id, regCode, owner, maintCycle, useDate',
+        plans: 'id, elevatorId, cycleType, state, planDate, executor, [elevatorId+planDate]',
+        checkItems: 'id, planId, seq, result, itemName, [planId+seq]',
+        rescues: 'id, elevatorId, alarmAt, responder, rectifyId',
+        rectifies: 'id, elevatorId, state, dueDate, reviewer, source, rescueId, planId',
+        settings: 'id',
+      })
+      .upgrade(async (tx) => {
+        // 全表行修订号升级到 v3
+        const tables: Array<Table<Record<string, unknown>, string>> = [
+          tx.table('elevators'),
+          tx.table('plans'),
+          tx.table('checkItems'),
+          tx.table('rescues'),
+          tx.table('rectifies'),
+        ];
+        for (const table of tables) {
+          await table.toCollection().modify((row: Record<string, unknown>) => {
+            row.revision = ROW_REVISION;
+          });
+        }
+        // 历史整改单：项名命中任一百保养项名的视为保养异常项转整改，其余为手动登记
+        const checkItemNames = new Set<string>();
+        await tx.table('checkItems').each((row: Record<string, unknown>) => {
+          if (typeof row.itemName === 'string') checkItemNames.add(row.itemName);
+        });
+        await tx.table('rectifies').toCollection().modify((row: Record<string, unknown>) => {
+          if (typeof row.source !== 'string') {
+            row.source = typeof row.item === 'string' && checkItemNames.has(row.item) ? 'maintenance' : 'manual';
+          }
+          if (row.rescueId === undefined) row.rescueId = null;
+          if (row.planId === undefined) row.planId = null;
+        });
+        // 历史困人事件：初始无关联整改单（复盘时可再登记）
+        await tx.table('rescues').toCollection().modify((row: Record<string, unknown>) => {
+          if (row.rectifyId === undefined) row.rectifyId = null;
+        });
+      });
   }
 }
 
@@ -121,8 +164,21 @@ interface SeedElevatorSpec {
     cause: string;
     trappedCount: number;
     responder: string;
+    /** 复盘后登记 / 复用的整改单（id 相对救援序号生成） */
+    rectify?: {
+      /** 整改项名；与待整改单同名时演示复用，不换限期 */
+      item: string;
+      /** 建议限期相对今天的天数（加紧 3 / 常规 7，仅新建生效） */
+      dueOffsetDays: number;
+      /** 沿用的保养计划序号（从 1 开始，按 spec.plans 顺序） */
+      planIndex?: number;
+      /** 复用已存在的待整改单时填其在 manualRectifies 中的序号 */
+      reuseManualIndex?: number;
+      reviewer: string;
+    };
   }>;
-  rectifies: Array<{ item: string; dueOffsetDays: number; state: Rectify['state']; reviewer: string }>;
+  /** 与救援无关的手动 / 年检整改单 */
+  manualRectifies: Array<{ item: string; dueOffsetDays: number; state: Rectify['state']; reviewer: string }>;
 }
 
 const SEED_ELEVATORS: SeedElevatorSpec[] = [
@@ -135,7 +191,7 @@ const SEED_ELEVATORS: SeedElevatorSpec[] = [
     maintCycle: 'halfMonth',
     plans: [
       { cycleType: 'halfMonth', offsetDays: -22, executor: '刘建国', state: 'signed', abnormalSeq: [], adviceSeq: [] },
-      { cycleType: 'halfMonth', offsetDays: -7, executor: '刘建国', state: 'signed', abnormalSeq: [3], adviceSeq: [] },
+      { cycleType: 'halfMonth', offsetDays: -7, executor: '刘建国', state: 'signed', abnormalSeq: [5], adviceSeq: [] },
       { cycleType: 'halfMonth', offsetDays: 6, executor: '张海涛', state: 'executing', abnormalSeq: [], adviceSeq: [] },
       { cycleType: 'quarter', offsetDays: -35, executor: '张海涛', state: 'signed', abnormalSeq: [], adviceSeq: [7] },
     ],
@@ -157,9 +213,10 @@ const SEED_ELEVATORS: SeedElevatorSpec[] = [
         cause: '变频器故障',
         trappedCount: 1,
         responder: '张海涛',
+        rectify: { item: '变频器故障', dueOffsetDays: 0, reviewer: '王敏' },
       },
     ],
-    rectifies: [
+    manualRectifies: [
       { item: '层门门锁啮合深度不足', dueOffsetDays: -5, state: 'pending', reviewer: '王敏' },
       { item: '轿厢应急照明失效', dueOffsetDays: 12, state: 'pending', reviewer: '王敏' },
     ],
@@ -185,9 +242,10 @@ const SEED_ELEVATORS: SeedElevatorSpec[] = [
         cause: '停电困人',
         trappedCount: 3,
         responder: '陈志远',
+        rectify: { item: '停电困人', dueOffsetDays: -19, reviewer: '王敏' },
       },
     ],
-    rectifies: [
+    manualRectifies: [
       { item: '制动器制动力矩不足', dueOffsetDays: 8, state: 'pending', reviewer: '王敏' },
     ],
   },
@@ -201,10 +259,24 @@ const SEED_ELEVATORS: SeedElevatorSpec[] = [
     plans: [
       { cycleType: 'halfMonth', offsetDays: -31, executor: '刘建国', state: 'signed', abnormalSeq: [], adviceSeq: [] },
       { cycleType: 'halfMonth', offsetDays: -2, executor: '刘建国', state: 'pending', abnormalSeq: [], adviceSeq: [] },
+      { cycleType: 'quarter', offsetDays: -16, executor: '刘建国', state: 'signed', abnormalSeq: [], adviceSeq: [8] },
     ],
-    rescues: [],
-    rectifies: [
+    rescues: [
+      {
+        offsetDays: -5,
+        alarmHour: 17,
+        arriveLagMinutes: 34,
+        rescueLagMinutes: 52,
+        cause: '超载保护动作',
+        trappedCount: 4,
+        responder: '张海涛',
+        // 沿用最近已签署季度计划的建议项「超载保护装置」，复用待整改单、保留原限期
+        rectify: { item: '超载保护装置', dueOffsetDays: 3, planIndex: 3, reuseManualIndex: 2, reviewer: '王敏' },
+      },
+    ],
+    manualRectifies: [
       { item: '超载保护装置失灵', dueOffsetDays: -11, state: 'reviewed', reviewer: '李强' },
+      { item: '超载保护装置', dueOffsetDays: 3, state: 'pending', reviewer: '王敏' },
       { item: '钢丝绳断丝超标', dueOffsetDays: 20, state: 'pending', reviewer: '李强' },
     ],
   },
@@ -292,6 +364,24 @@ async function seedDatabase(): Promise<void> {
       );
     });
 
+    // 与救援无关的手动 / 年检整改单先生成，供救援复盘演示复用
+    spec.manualRectifies.forEach((rectifySpec, rectifyIndex) => {
+      rectifies.push({
+        id: `rect-manual-${elevatorIndex + 1}-${rectifyIndex + 1}`,
+        elevatorId,
+        item: rectifySpec.item,
+        dueDate: addDays(todayDate(), rectifySpec.dueOffsetDays),
+        state: rectifySpec.state,
+        source: 'manual',
+        rescueId: null,
+        planId: null,
+        reviewer: rectifySpec.reviewer,
+        reviewedAt: rectifySpec.state === 'reviewed' ? `${addDays(todayDate(), -3)} 10:30` : null,
+        createdAt: stamp,
+        revision: ROW_REVISION,
+      });
+    });
+
     spec.rescues.forEach((rescueSpec, rescueIndex) => {
       const date = addDays(todayDate(), rescueSpec.offsetDays);
       const alarmAt = `${date} ${String(rescueSpec.alarmHour).padStart(2, '0')}:05`;
@@ -301,8 +391,38 @@ async function seedDatabase(): Promise<void> {
       const rescueAt = `${date} ${String(
         rescueSpec.alarmHour + Math.floor((5 + rescueSpec.rescueLagMinutes) / 60),
       ).padStart(2, '0')}:${String((5 + rescueSpec.rescueLagMinutes) % 60).padStart(2, '0')}`;
+      const rescueId = `rescue-${elevatorIndex + 1}-${rescueIndex + 1}`;
+
+      // 复盘整改单：复用已有待整改单（保留原限期）或按救援复盘新建
+      let linkedRectifyId: string | null = null;
+      if (rescueSpec.rectify) {
+        const specRectify = rescueSpec.rectify;
+        if (specRectify.reuseManualIndex !== undefined) {
+          linkedRectifyId = `rect-manual-${elevatorIndex + 1}-${specRectify.reuseManualIndex}`;
+        } else {
+          linkedRectifyId = `rect-rescue-${elevatorIndex + 1}-${rescueIndex + 1}`;
+          rectifies.push({
+            id: linkedRectifyId,
+            elevatorId,
+            item: specRectify.item,
+            dueDate: addDays(todayDate(), specRectify.dueOffsetDays),
+            state: 'pending',
+            source: 'rescue',
+            rescueId,
+            planId:
+              specRectify.planIndex !== undefined
+                ? `plan-${elevatorIndex + 1}-${specRectify.planIndex}`
+                : null,
+            reviewer: specRectify.reviewer,
+            reviewedAt: null,
+            createdAt: stamp,
+            revision: ROW_REVISION,
+          });
+        }
+      }
+
       rescues.push({
-        id: `rescue-${elevatorIndex + 1}-${rescueIndex + 1}`,
+        id: rescueId,
         elevatorId,
         alarmAt,
         arriveAt,
@@ -310,23 +430,23 @@ async function seedDatabase(): Promise<void> {
         cause: rescueSpec.cause,
         trappedCount: rescueSpec.trappedCount,
         responder: rescueSpec.responder,
+        rectifyId: linkedRectifyId,
         createdAt: stamp,
         revision: ROW_REVISION,
       });
-    });
 
-    spec.rectifies.forEach((rectifySpec, rectifyIndex) => {
-      rectifies.push({
-        id: `rect-${elevatorIndex + 1}-${rectifyIndex + 1}`,
-        elevatorId,
-        item: rectifySpec.item,
-        dueDate: addDays(todayDate(), rectifySpec.dueOffsetDays),
-        state: rectifySpec.state,
-        reviewer: rectifySpec.reviewer,
-        reviewedAt: rectifySpec.state === 'reviewed' ? `${addDays(todayDate(), -3)} 10:30` : null,
-        createdAt: stamp,
-        revision: ROW_REVISION,
-      });
+      // 复用待整改单：回填救援关联，限期保持不变
+      if (rescueSpec.rectify?.reuseManualIndex !== undefined && linkedRectifyId) {
+        const target = rectifies.find((row) => row.id === linkedRectifyId);
+        if (target) {
+          target.rescueId = rescueId;
+          target.source = 'rescue';
+          target.planId =
+            rescueSpec.rectify.planIndex !== undefined
+              ? `plan-${elevatorIndex + 1}-${rescueSpec.rectify.planIndex}`
+              : null;
+        }
+      }
     });
   });
 
@@ -509,8 +629,25 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
       await db.elevators.bulkPut(snapshot.elevators ?? []);
       await db.plans.bulkPut(snapshot.plans ?? []);
       await db.checkItems.bulkPut(snapshot.checkItems ?? []);
-      await db.rescues.bulkPut(snapshot.rescues ?? []);
-      await db.rectifies.bulkPut(snapshot.rectifies ?? []);
+      // 兼容旧版快照：补齐 v3 来源与关联字段
+      const checkItemNames = new Set((snapshot.checkItems ?? []).map((item) => item.itemName));
+      await db.rescues.bulkPut(
+        (snapshot.rescues ?? []).map((row) => ({
+          ...row,
+          rectifyId: row.rectifyId ?? null,
+          revision: typeof row.revision === 'number' ? row.revision : ROW_REVISION,
+        })),
+      );
+      await db.rectifies.bulkPut(
+        (snapshot.rectifies ?? []).map((row) => ({
+          ...row,
+          source:
+            row.source ?? (checkItemNames.has(row.item) ? ('maintenance' as const) : ('manual' as const)),
+          rescueId: row.rescueId ?? null,
+          planId: row.planId ?? null,
+          revision: typeof row.revision === 'number' ? row.revision : ROW_REVISION,
+        })),
+      );
     },
   );
 }

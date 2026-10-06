@@ -6,26 +6,57 @@ import { computed, ref } from 'vue';
 import { defineStore } from 'pinia';
 import {
   ROW_REVISION,
+  listCheckItems,
   listElevators,
+  listPlans,
+  listRectifies,
   listRescues,
   putRescue,
   removeRescue,
+  type CheckItemRow,
   type ElevatorRow,
+  type PlanRow,
+  type RectifyRow,
   type RescueRow,
 } from '../utils/db';
 import {
-  ARRIVE_LIMIT_MINUTES,
   type RescueDraft,
+  type RescueRectifyBrief,
   type RescueTimelineNode,
   type RescueView,
 } from '../types/rescue';
 import { arriveMinutes, nowDateTime, rescueMinutes } from '../utils/duration';
+import {
+  ARRIVE_LIMIT_MINUTES,
+  findRelatedCheckItem,
+  isUrgentRescue,
+  NORMAL_DUE_DAYS,
+  resolveRescueRectify,
+  suggestedDueDate,
+  suggestedDueDays,
+  URGENT_DUE_DAYS,
+} from '../utils/rescueReview';
+import { overdueDaysOf } from '../types/rectify';
 import { uuid } from '../utils/export';
 import { emitChange, onChange } from '../utils/events';
+
+/** 复盘登记前的预演结果（救援页展示将沿用哪个保养项 / 是否复用待整改单） */
+export interface RescueRectifyPreview {
+  item: string;
+  mode: 'reuseMaintenance' | 'createMaintenance' | 'createCause';
+  planDate: string | null;
+  urgent: boolean;
+  dueDays: number;
+  dueDate: string;
+  reasonText: string;
+}
 
 export const useRescueStore = defineStore('rescue', () => {
   const rescues = ref<RescueRow[]>([]);
   const elevators = ref<ElevatorRow[]>([]);
+  const rectifies = ref<RectifyRow[]>([]);
+  const plans = ref<PlanRow[]>([]);
+  const checkItems = ref<CheckItemRow[]>([]);
   /** 复盘选中的事件 */
   const activeRescueId = ref<string>('');
   const loading = ref(false);
@@ -36,9 +67,18 @@ export const useRescueStore = defineStore('rescue', () => {
   async function load(): Promise<void> {
     loading.value = true;
     try {
-      const [rescueRows, elevatorRows] = await Promise.all([listRescues(), listElevators()]);
+      const [rescueRows, elevatorRows, rectifyRows, planRows, itemRows] = await Promise.all([
+        listRescues(),
+        listElevators(),
+        listRectifies(),
+        listPlans(),
+        listCheckItems(),
+      ]);
       rescues.value = rescueRows;
       elevators.value = elevatorRows;
+      rectifies.value = rectifyRows;
+      plans.value = planRows;
+      checkItems.value = itemRows;
       error.value = '';
       if (!activeRescueId.value || !rescueRows.some((item) => item.id === activeRescueId.value)) {
         activeRescueId.value = rescueRows[0]?.id ?? '';
@@ -71,6 +111,7 @@ export const useRescueStore = defineStore('rescue', () => {
       cause: draft.cause.trim(),
       trappedCount: draft.trappedCount,
       responder: draft.responder.trim(),
+      rectifyId: null,
       createdAt: nowDateTime(),
       revision: ROW_REVISION,
     };
@@ -92,6 +133,8 @@ export const useRescueStore = defineStore('rescue', () => {
       cause: draft.cause.trim(),
       trappedCount: draft.trappedCount,
       responder: draft.responder.trim(),
+      // 编辑事件不解除已登记的整改关联（处理以复盘登记为准）
+      rectifyId: existing.rectifyId ?? null,
     });
     emitChange();
   }
@@ -106,12 +149,26 @@ export const useRescueStore = defineStore('rescue', () => {
     activeRescueId.value = id;
   }
 
-  /** 困人事件视图：自动算到场与救援时长、时间线回放节点 */
+  /** 困人事件视图：自动算到场与救援时长、时间线回放节点、整改处理情况 */
   const rescueViews = computed<RescueView[]>(() =>
     rescues.value.map((rescue) => {
       const elevator = elevators.value.find((item) => item.id === rescue.elevatorId);
       const arrive = arriveMinutes(rescue.alarmAt, rescue.arriveAt);
       const total = rescueMinutes(rescue.alarmAt, rescue.rescueAt);
+      const linked = rescue.rectifyId
+        ? rectifies.value.find((item) => item.id === rescue.rectifyId)
+        : undefined;
+      const linkedBrief: RescueRectifyBrief | null = linked
+        ? {
+            id: linked.id,
+            item: linked.item,
+            dueDate: linked.dueDate,
+            state: linked.state,
+            source: linked.source ?? 'manual',
+            overdue: overdueDaysOf(linked.dueDate, linked.state) > 0,
+            overdueDays: overdueDaysOf(linked.dueDate, linked.state),
+          }
+        : null;
       const timeline: RescueTimelineNode[] = [
         {
           label: '接警',
@@ -145,10 +202,42 @@ export const useRescueStore = defineStore('rescue', () => {
         arriveMinutes: arrive,
         rescueMinutes: total,
         arriveInTime: arrive > 0 && arrive <= ARRIVE_LIMIT_MINUTES,
+        urgentRectify: isUrgentRescue(rescue),
+        suggestedDueDays: suggestedDueDays(rescue),
+        linkedRectify: linkedBrief,
         timeline,
       };
     }),
   );
+
+  /**
+   * 复盘登记前预演：沿最近一次已签署计划找对应异常 / 建议项，
+   * 给出将沿用 / 复用 / 新建的整改项与限期口径（不落库）。
+   */
+  function previewRectify(rescueId: string): RescueRectifyPreview | null {
+    const rescue = rescues.value.find((item) => item.id === rescueId);
+    if (!rescue) return null;
+    const resolution = resolveRescueRectify({
+      rescue,
+      plans: plans.value,
+      checkItems: checkItems.value,
+      rectifies: rectifies.value,
+    });
+    return {
+      item: resolution.item,
+      mode: resolution.mode,
+      planDate: resolution.plan?.planDate ?? null,
+      urgent: resolution.urgent,
+      dueDays: suggestedDueDays(rescue),
+      dueDate: suggestedDueDate(rescue),
+      reasonText: resolution.reasonText,
+    };
+  }
+
+  /** 该电梯报警前最近一次已签署计划是否含与原因对应的异常 / 建议项（页面轻量提示用） */
+  function hasRelatedCheckItem(rescue: RescueRow): boolean {
+    return findRelatedCheckItem(plans.value, checkItems.value, rescue.elevatorId, rescue) !== null;
+  }
 
   const activeRescue = computed(
     () => rescueViews.value.find((item) => item.id === activeRescueId.value) ?? null,
@@ -206,6 +295,9 @@ export const useRescueStore = defineStore('rescue', () => {
   return {
     rescues,
     elevators,
+    rectifies,
+    plans,
+    checkItems,
     activeRescueId,
     loading,
     error,
@@ -224,6 +316,10 @@ export const useRescueStore = defineStore('rescue', () => {
     byElevator,
     trappedTotal,
     onTimeRate,
+    previewRectify,
+    hasRelatedCheckItem,
     ARRIVE_LIMIT_MINUTES,
+    URGENT_DUE_DAYS,
+    NORMAL_DUE_DAYS,
   };
 });

@@ -8,6 +8,15 @@ export const RECTIFY_STATE_LABEL: Record<RectifyState, string> = {
   reviewed: '已复核',
 };
 
+/** 整改来源：保养异常项转整改 / 困人复盘登记 / 手动登记 */
+export type RectifySource = 'maintenance' | 'rescue' | 'manual';
+
+export const RECTIFY_SOURCE_LABEL: Record<RectifySource, string> = {
+  maintenance: '保养发现',
+  rescue: '困人救援',
+  manual: '手动登记',
+};
+
 /** 年检整改单 */
 export interface Rectify extends Revisioned {
   id: string;
@@ -19,6 +28,12 @@ export interface Rectify extends Revisioned {
   dueDate: string;
   /** 状态 */
   state: RectifyState;
+  /** 来源：保养 / 救援 / 手动（历史数据缺省为手动登记） */
+  source: RectifySource;
+  /** 来源困人事件 id（来源为困人救援时回填） */
+  rescueId: string | null;
+  /** 来源保养计划 id（沿用保养异常/建议项时回填） */
+  planId: string | null;
   /** 复核人 */
   reviewer: string;
   /** 复核时间 */
@@ -32,12 +47,21 @@ export interface RectifyDraft {
   item: string;
   dueDate: string;
   reviewer: string;
+  source?: RectifySource;
+  rescueId?: string | null;
+  planId?: string | null;
 }
 
 /** 整改单视图：带电梯上下文与超期天数 */
 export interface RectifyView extends Rectify {
   elevatorName: string;
   owner: string;
+  /** 来源标签（如「保养发现」「困人救援」） */
+  sourceLabel: string;
+  /** 来源困人事件报警时间（救援来源时展示） */
+  rescueAlarmAt: string | null;
+  /** 来源保养计划日期（沿用保养项时展示） */
+  planDate: string | null;
   /** 是否超期（未复核且限期早于今天） */
   overdue: boolean;
   /** 超期天数（未超期为 0） */

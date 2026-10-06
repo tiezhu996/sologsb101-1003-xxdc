@@ -28,6 +28,7 @@ docker compose up -d --build # 代码改动后重建
 - 逐项填写实测值与结果（正常 / 异常 / 建议）并签署，签署时校验未填项
 - 异常项一键转年检整改单，复核通过后关闭
 - 录入困人救援的报警 / 到场 / 救出时间，自动计算到场与救援时长并按 30 分钟到场要求判定
+- 困人复盘按规则登记整改：沿用同一电梯最近一次已签署保养的对应异常 / 建议项并复用未复核同项整改单，找不到时才按救援原因登记；到场超时或救出超 1 小时限期 3 日，其余 7 日，已有待整改单不换限期
 - 整库 JSON 导出 / 导入与 IndexedDB 结构版本查看
 
 本项目为**纯前端单页应用**：无后端、无数据库服务、无外部接口，全部数据保存在浏览器 IndexedDB。
@@ -84,13 +85,13 @@ sologsb101-1003/
         ├── hooks/               # usePlanProgress.ts useIdbTable.ts
         ├── pages/               # ElevatorList.vue PlanList.vue PlanExecute.vue RescueTimeline.vue RectifyList.vue
         ├── router/index.ts
-        └── utils/               # duration.ts cycle.ts db.ts export.ts events.ts
+        └── utils/               # duration.ts cycle.ts db.ts export.ts events.ts rescueReview.ts
 ```
 
 ## 六、数据存储说明
 
 - **存储介质**：浏览器 IndexedDB，库名 **`gbelevsvc`**，通过 Dexie 4.x 封装。
-- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 2`，并登记 v1 → v2 的 `upgrade` 迁移（补齐行修订号、迁移 `executorName → executor`、初始化保养项结果字段、新增 `settings` 表）。
+- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 3`，并登记 v1 → v2、v2 → v3 的 `upgrade` 迁移（v2 补齐行修订号、迁移 `executorName → executor`、初始化保养项结果字段、新增 `settings` 表；v3 为整改单补充 `source / rescueId / planId` 来源关联、为困人事件补充 `rectifyId` 复盘关联）。
 - **数据表**：
 
   | 表名 | 实体 | 主要索引 |
@@ -98,8 +99,8 @@ sologsb101-1003/
   | `elevators` | 电梯 | id / regCode / owner / maintCycle / useDate |
   | `plans` | 保养计划 | id / elevatorId / cycleType / state / planDate / executor / [elevatorId+planDate] |
   | `checkItems` | 保养项 | id / planId / seq / result / itemName / [planId+seq] |
-  | `rescues` | 困人事件 | id / elevatorId / alarmAt / responder |
-  | `rectifies` | 整改单 | id / elevatorId / state / dueDate / reviewer |
+  | `rescues` | 困人事件 | id / elevatorId / alarmAt / responder / rectifyId |
+  | `rectifies` | 整改单 | id / elevatorId / state / dueDate / reviewer / source / rescueId / planId |
   | `settings` | 自定义字典 | id |
 
 - **首屏自动播种**：`initDatabase()` 在 `elevators` 表为空时写入演示数据（幂等）——3 台电梯 × 各 2~4 期计划 × 每期 5~10 个保养项（含异常 / 建议项）+ 3 起困人事件 + 5 条整改单，父子记录通过 `elevatorId / planId` 互相引用。

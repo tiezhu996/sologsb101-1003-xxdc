@@ -1,4 +1,5 @@
 import type { Revisioned } from './persistence';
+import type { RectifySource, RectifyState } from './rectify';
 
 /** 困人事件原因字典 */
 export const RESCUE_CAUSES = [
@@ -27,6 +28,8 @@ export interface Rescue extends Revisioned {
   trappedCount: number;
   /** 救援人 */
   responder: string;
+  /** 复盘后登记 / 复用的整改单 id（未登记为 null） */
+  rectifyId: string | null;
   createdAt: string;
 }
 
@@ -41,6 +44,17 @@ export interface RescueDraft {
   responder: string;
 }
 
+/** 关联整改单摘要（救援页展示处理情况） */
+export interface RescueRectifyBrief {
+  id: string;
+  item: string;
+  dueDate: string;
+  state: RectifyState;
+  source: RectifySource;
+  overdue: boolean;
+  overdueDays: number;
+}
+
 /** 困人事件视图：自动算到场与救援时长 */
 export interface RescueView extends Rescue {
   elevatorName: string;
@@ -51,6 +65,12 @@ export interface RescueView extends Rescue {
   rescueMinutes: number;
   /** 是否满足 30 分钟到场要求 */
   arriveInTime: boolean;
+  /** 是否触发加紧限期：到场超时或救出超过 60 分钟 */
+  urgentRectify: boolean;
+  /** 建议整改限期（自然日，自救出当日起算）：加紧 3 日 / 常规 7 日 */
+  suggestedDueDays: number;
+  /** 关联整改单摘要（已登记 / 复用） */
+  linkedRectify: RescueRectifyBrief | null;
   /** 时间线节点（用于回放展示） */
   timeline: RescueTimelineNode[];
 }

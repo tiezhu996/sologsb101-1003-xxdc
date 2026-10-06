@@ -33,8 +33,10 @@ import { useRectifyStore } from '../stores/rectifyStore';
 import { useElevatorStore } from '../stores/elevatorStore';
 import {
   RECTIFY_ITEM_LIBRARY,
+  RECTIFY_SOURCE_LABEL,
   RECTIFY_STATE_LABEL,
   type RectifyDraft,
+  type RectifySource,
   type RectifyState,
   type RectifyView,
 } from '../types/rectify';
@@ -64,6 +66,7 @@ const elevatorStore = useElevatorStore();
 const keyword = ref('');
 const stateFilters = ref<RectifyState[]>([]);
 const ownerFilters = ref<string[]>([]);
+const sourceFilters = ref<RectifySource[]>([]);
 const overdueOnly = ref(false);
 
 const { data: counts, reload: reloadCounts } = useIdbTable(countAll, []);
@@ -78,6 +81,7 @@ onMounted(async () => {
 function onFilterChange(values: Record<string, string[]>): void {
   stateFilters.value = (values.state ?? []) as RectifyState[];
   ownerFilters.value = values.owner ?? [];
+  sourceFilters.value = (values.source ?? []) as RectifySource[];
 }
 
 const filtered = computed(() => {
@@ -85,6 +89,7 @@ const filtered = computed(() => {
   return rectifyStore.rectifyViews.filter((row) => {
     if (stateFilters.value.length > 0 && !stateFilters.value.includes(row.state)) return false;
     if (ownerFilters.value.length > 0 && !ownerFilters.value.includes(row.owner)) return false;
+    if (sourceFilters.value.length > 0 && !sourceFilters.value.includes(row.source)) return false;
     if (overdueOnly.value && !row.overdue) return false;
     if (lower && !`${row.elevatorName} ${row.item} ${row.reviewer}`.toLowerCase().includes(lower)) return false;
     return true;
@@ -183,18 +188,63 @@ async function handleReset(): Promise<void> {
 }
 
 function exportOverdueCsv(): void {
-  const rows: Array<Array<string | number>> = [['电梯', '不合格项', '限期', '状态', '超期天数', '复核人']];
+  const rows: Array<Array<string | number>> = [['电梯', '不合格项', '来源', '限期', '状态', '超期天数', '复核人']];
   for (const row of rectifyStore.rectifyViews) {
-    rows.push([row.elevatorName, row.item, row.dueDate, RECTIFY_STATE_LABEL[row.state], row.overdueDays, row.reviewer]);
+    rows.push([
+      row.elevatorName,
+      row.item,
+      RECTIFY_SOURCE_LABEL[row.source ?? 'manual'],
+      row.dueDate,
+      RECTIFY_STATE_LABEL[row.state],
+      row.overdueDays,
+      row.reviewer,
+    ]);
   }
   downloadCsv(`gbelevsvc-rectify-${todayDate()}.csv`, rows);
   message.success('整改清单已导出 CSV');
 }
 
+const SOURCE_TAG_TYPE: Record<RectifySource, 'info' | 'warning' | 'default'> = {
+  maintenance: 'info',
+  rescue: 'warning',
+  manual: 'default',
+};
+
 const columns = computed<DataTableColumns<RectifyView>>(() => [
   { title: '电梯', key: 'elevatorName', minWidth: 210, ellipsis: { tooltip: true } },
-  { title: '不合格项', key: 'item', minWidth: 180 },
-  { title: '限期', key: 'dueDate', width: 120 },
+  { title: '不合格项', key: 'item', minWidth: 170 },
+  {
+    title: '来源',
+    key: 'source',
+    width: 150,
+    render: (row) =>
+      h(
+        NSpace,
+        { size: 4, vertical: true },
+        {
+          default: () => [
+            h(
+              NTag,
+              { size: 'small', round: true, bordered: false, type: SOURCE_TAG_TYPE[row.source ?? 'manual'] },
+              { default: () => RECTIFY_SOURCE_LABEL[row.source ?? 'manual'] },
+            ),
+            h(
+              NText,
+              { depth: 3, style: 'font-size:12px' },
+              {
+                default: () =>
+                  row.source === 'rescue' && row.rescueAlarmAt
+                    ? `救援 ${row.rescueAlarmAt.slice(0, 10)}`
+                    : row.source === 'maintenance' && row.planDate
+                      ? `保养 ${row.planDate}`
+                      : '手动登记',
+              },
+            ),
+          ],
+        },
+      ),
+  },
+  { title: '限期', key: 'dueDate', width: 110 },
   {
     title: '状态',
     key: 'state',
@@ -331,13 +381,23 @@ const columns = computed<DataTableColumns<RectifyView>>(() => [
             { label: '待整改', value: 'pending' },
             { label: '已复核', value: 'reviewed' },
           ],
-          width: 180,
+          width: 150,
+        },
+        {
+          key: 'source',
+          label: '来源',
+          options: [
+            { label: '保养发现', value: 'maintenance' },
+            { label: '困人救援', value: 'rescue' },
+            { label: '手动登记', value: 'manual' },
+          ],
+          width: 150,
         },
         {
           key: 'owner',
           label: '使用单位',
           options: elevatorStore.ownerGroups.map((item) => ({ label: item.owner, value: item.owner })),
-          width: 220,
+          width: 200,
         },
       ]"
       :result-count="filtered.length"
@@ -366,7 +426,7 @@ const columns = computed<DataTableColumns<RectifyView>>(() => [
             :data="filtered"
             :bordered="false"
             size="small"
-            :scroll-x="1160"
+            :scroll-x="1300"
             :pagination="{ pageSize: 9 }"
             :row-class-name="(row: RectifyView) => (row.overdue ? 'row-marked' : '')"
           />

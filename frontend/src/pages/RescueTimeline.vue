@@ -2,16 +2,20 @@
 /**
  * /rescues 困人救援时间线
  * 录入报警 / 到场 / 救出时间，自动算响应时长并按电梯复盘；
- * 消费 Rescue、Elevator 与 <FilterBar>、<StatBadge>。
+ * 复盘后按规则登记整改：沿用最近已签署保养的对应项并复用待整改单，否则按救援原因登记；
+ * 消费 Rescue、Elevator、Rectify 与 <FilterBar>、<StatBadge>。
  */
 import { computed, h, onMounted, ref } from 'vue';
+import { useRouter } from 'vue-router';
 import {
+  NAlert,
   NButton,
   NCard,
   NDataTable,
   NDatePicker,
   NDescriptions,
   NDescriptionsItem,
+  NDivider,
   NForm,
   NFormItem,
   NGrid,
@@ -31,19 +35,26 @@ import {
 } from 'naive-ui';
 import { useRescueStore } from '../stores/rescueStore';
 import { useElevatorStore } from '../stores/elevatorStore';
-import { ARRIVE_LIMIT_MINUTES, RESCUE_CAUSES, type RescueDraft, type RescueView } from '../types/rescue';
+import { useRectifyStore } from '../stores/rectifyStore';
+import { ROUTES } from '../router';
+import { RESCUE_CAUSES, type RescueDraft, type RescueView } from '../types/rescue';
+import { RECTIFY_SOURCE_LABEL } from '../types/rectify';
+import { ARRIVE_LIMIT_MINUTES, RESCUE_LIMIT_MINUTES } from '../utils/rescueReview';
 import { formatMinutes } from '../utils/duration';
 import StatBadge from '../components/common/StatBadge.vue';
 import EmptyPanel from '../components/common/EmptyPanel.vue';
 import FilterBar from '../components/common/FilterBar.vue';
 
 const message = useMessage();
+const router = useRouter();
 const rescueStore = useRescueStore();
 const elevatorStore = useElevatorStore();
+const rectifyStore = useRectifyStore();
 
 const keyword = ref('');
 const elevatorFilters = ref<string[]>([]);
 const activeFilter = ref<'all' | 'late'>('all');
+const registering = ref(false);
 
 const formRef = ref<FormInst | null>(null);
 const modalOpen = ref(false);
@@ -72,6 +83,7 @@ const formModel = ref<RescueFormModel>({
 onMounted(async () => {
   await rescueStore.bootstrap();
   await elevatorStore.bootstrap();
+  await rectifyStore.bootstrap();
 });
 
 function onFilterChange(values: Record<string, string[]>): void {
@@ -104,6 +116,34 @@ const medianRescue = computed(() => {
   const middle = Math.floor(values.length / 2);
   return values.length % 2 === 0 ? Math.round((values[middle - 1] + values[middle]) / 2) : values[middle];
 });
+
+/** 当前复盘事件的整改登记预演（不落库，给管理员确认来源与限期） */
+const activePreview = computed(() =>
+  rescueStore.activeRescue ? rescueStore.previewRectify(rescueStore.activeRescue.id) : null,
+);
+
+/** 复盘登记 / 复用整改单 */
+async function registerRectify(): Promise<void> {
+  const active = rescueStore.activeRescue;
+  if (!active || registering.value) return;
+  registering.value = true;
+  try {
+    const result = await rectifyStore.registerFromRescue(active);
+    if (result.reused) {
+      message.success(`已复用待整改单「${result.item}」，保留原限期 ${result.dueDate}，未重复开单`);
+    } else if (result.fromMaintenance) {
+      message.success(`已沿用保养项「${result.item}」登记整改，限期至 ${result.dueDate}`);
+    } else {
+      message.success(`已按救援原因「${result.item}」登记整改，限期至 ${result.dueDate}`);
+    }
+  } finally {
+    registering.value = false;
+  }
+}
+
+function gotoRectifies(): void {
+  void router.push(ROUTES.rectifies);
+}
 
 function pad(value: number): string {
   return String(value).padStart(2, '0');
@@ -216,6 +256,38 @@ const columns = computed<DataTableColumns<RescueView>>(() => [
   { title: '原因', key: 'cause', minWidth: 140 },
   { title: '救援人', key: 'responder', width: 100 },
   {
+    title: '整改处理',
+    key: 'linkedRectify',
+    width: 180,
+    render: (row) => {
+      const linked = row.linkedRectify;
+      if (!linked) {
+        return h(NTag, { size: 'small', round: true, bordered: false }, { default: () => '复盘后登记' });
+      }
+      return h(
+        NSpace,
+        { size: 4, vertical: true },
+        {
+          default: () => [
+            h(
+              NTag,
+              {
+                size: 'small',
+                round: true,
+                type: linked.state === 'reviewed' ? 'success' : linked.overdue ? 'error' : 'warning',
+              },
+              {
+                default: () =>
+                  `${RECTIFY_SOURCE_LABEL[linked.source]} · ${linked.state === 'reviewed' ? '已复核' : '待整改'}`,
+              },
+            ),
+            h(NText, { depth: 3, style: 'font-size:12px' }, { default: () => `限期 ${linked.dueDate}` }),
+          ],
+        },
+      );
+    },
+  },
+  {
     title: '操作',
     key: 'actions',
     width: 170,
@@ -320,7 +392,7 @@ const columns = computed<DataTableColumns<RescueView>>(() => [
             :data="filtered"
             :bordered="false"
             size="small"
-            :scroll-x="1130"
+            :scroll-x="1310"
             :pagination="{ pageSize: 8 }"
             :row-class-name="(row: RescueView) => (!row.arriveInTime ? 'row-marked' : '')"
           />
@@ -361,6 +433,62 @@ const columns = computed<DataTableColumns<RescueView>>(() => [
                 :content="`${node.minutesFromAlarm === 0 ? '报警起点' : `距报警 ${formatMinutes(node.minutesFromAlarm)}`} · ${node.detail}`"
               />
             </n-timeline>
+
+            <!-- 复盘整改：沿用最近已签署保养对应项并复用待整改单，否则按救援原因登记 -->
+            <n-divider style="margin: 12px 0" />
+            <n-space vertical :size="8">
+              <n-text strong style="font-size: 13px">整改处理</n-text>
+              <template v-if="rescueStore.activeRescue.linkedRectify">
+                <n-space align="center" :size="8">
+                  <n-tag
+                    size="small"
+                    round
+                    :type="
+                      rescueStore.activeRescue.linkedRectify.state === 'reviewed'
+                        ? 'success'
+                        : rescueStore.activeRescue.linkedRectify.overdue
+                          ? 'error'
+                          : 'warning'
+                    "
+                  >
+                    {{ RECTIFY_SOURCE_LABEL[rescueStore.activeRescue.linkedRectify.source] }} ·
+                    {{ rescueStore.activeRescue.linkedRectify.state === 'reviewed' ? '已复核' : '待整改' }}
+                  </n-tag>
+                  <n-tag
+                    v-if="rescueStore.activeRescue.linkedRectify.overdue && rescueStore.activeRescue.linkedRectify.state === 'pending'"
+                    size="small"
+                    type="error"
+                    round
+                  >
+                    超期 {{ rescueStore.activeRescue.linkedRectify.overdueDays }} 天
+                  </n-tag>
+                </n-space>
+                <n-text depth="3" style="font-size: 12px">
+                  整改项：{{ rescueStore.activeRescue.linkedRectify.item }} · 限期
+                  {{ rescueStore.activeRescue.linkedRectify.dueDate }}
+                </n-text>
+                <n-button size="small" quaternary type="primary" @click="gotoRectifies">前往整改页跟踪</n-button>
+              </template>
+              <template v-else-if="activePreview">
+                <n-alert
+                  :type="activePreview.urgent ? 'error' : 'info'"
+                  size="small"
+                  :show-icon="false"
+                  style="padding: 8px 10px"
+                >
+                  <n-text style="font-size: 12px">{{ activePreview.reasonText }}</n-text>
+                </n-alert>
+                <n-text depth="3" style="font-size: 12px">
+                  到场限 {{ ARRIVE_LIMIT_MINUTES }} 分钟、救出限 {{ RESCUE_LIMIT_MINUTES }} 分钟；
+                  本起到场 {{ formatMinutes(rescueStore.activeRescue.arriveMinutes) }}、救出
+                  {{ formatMinutes(rescueStore.activeRescue.rescueMinutes) }}，建议限期
+                  {{ activePreview.dueDate }}
+                </n-text>
+                <n-button size="small" type="primary" :loading="registering" @click="registerRectify">
+                  {{ activePreview.mode === 'reuseMaintenance' ? '复用待整改单' : '登记整改单' }}
+                </n-button>
+              </template>
+            </n-space>
           </template>
           <n-text v-else depth="3">点击左侧事件行的「复盘」查看完整时间线</n-text>
         </n-card>
