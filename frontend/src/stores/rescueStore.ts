@@ -6,26 +6,39 @@ import { computed, ref } from 'vue';
 import { defineStore } from 'pinia';
 import {
   ROW_REVISION,
+  listCheckItems,
   listElevators,
+  listPlans,
+  listRectifies,
   listRescues,
+  putRectify,
   putRescue,
   removeRescue,
+  type CheckItemRow,
   type ElevatorRow,
+  type PlanRow,
+  type RectifyRow,
   type RescueRow,
 } from '../utils/db';
 import {
   ARRIVE_LIMIT_MINUTES,
   type RescueDraft,
+  type RescueLinkedRectify,
   type RescueTimelineNode,
   type RescueView,
 } from '../types/rescue';
 import { arriveMinutes, nowDateTime, rescueMinutes } from '../utils/duration';
+import { resolveReviewOutcome, reviewDueDate, reviewDueDays, type ReviewOutcome } from '../utils/rescueReview';
+import { RECTIFY_HANDLE_LABEL, type RectifyHandleKind } from '../types/rectify';
 import { uuid } from '../utils/export';
 import { emitChange, onChange } from '../utils/events';
 
 export const useRescueStore = defineStore('rescue', () => {
   const rescues = ref<RescueRow[]>([]);
   const elevators = ref<ElevatorRow[]>([]);
+  const plans = ref<PlanRow[]>([]);
+  const checkItems = ref<CheckItemRow[]>([]);
+  const rectifies = ref<RectifyRow[]>([]);
   /** 复盘选中的事件 */
   const activeRescueId = ref<string>('');
   const loading = ref(false);
@@ -36,9 +49,18 @@ export const useRescueStore = defineStore('rescue', () => {
   async function load(): Promise<void> {
     loading.value = true;
     try {
-      const [rescueRows, elevatorRows] = await Promise.all([listRescues(), listElevators()]);
+      const [rescueRows, elevatorRows, planRows, itemRows, rectifyRows] = await Promise.all([
+        listRescues(),
+        listElevators(),
+        listPlans(),
+        listCheckItems(),
+        listRectifies(),
+      ]);
       rescues.value = rescueRows;
       elevators.value = elevatorRows;
+      plans.value = planRows;
+      checkItems.value = itemRows;
+      rectifies.value = rectifyRows;
       error.value = '';
       if (!activeRescueId.value || !rescueRows.some((item) => item.id === activeRescueId.value)) {
         activeRescueId.value = rescueRows[0]?.id ?? '';
@@ -72,6 +94,8 @@ export const useRescueStore = defineStore('rescue', () => {
       trappedCount: draft.trappedCount,
       responder: draft.responder.trim(),
       createdAt: nowDateTime(),
+      rectifyId: null,
+      rectifyHandleKind: null,
       revision: ROW_REVISION,
     };
     await putRescue(row);
@@ -97,6 +121,15 @@ export const useRescueStore = defineStore('rescue', () => {
   }
 
   async function deleteRescue(id: string): Promise<void> {
+    // 删除事件时解绑整改单上的救援引用，但保留整改台账本身
+    const linked = rectifies.value.filter((row) => row.rescueId === id || row.rescueIds.includes(id));
+    for (const row of linked) {
+      await putRectify({
+        ...row,
+        rescueId: row.rescueId === id ? null : row.rescueId,
+        rescueIds: row.rescueIds.filter((value) => value !== id),
+      });
+    }
     await removeRescue(id);
     if (activeRescueId.value === id) activeRescueId.value = '';
     emitChange();
@@ -106,12 +139,163 @@ export const useRescueStore = defineStore('rescue', () => {
     activeRescueId.value = id;
   }
 
+  /**
+   * 复盘预演：沿同电梯最近一次已签署计划找对应异常 / 建议项，
+   * 给出「复用未复核单 / 沿用保养项新建 / 按救援原因新建」三种处置结论与限期。
+   */
+  function previewReview(rescueId: string): {
+    outcome: ReviewOutcome;
+    dueDate: string;
+    dueDays: number;
+    planDate: string | null;
+  } | null {
+    const rescue = rescues.value.find((item) => item.id === rescueId);
+    if (!rescue) return null;
+    const { outcome, plan } = resolveReviewOutcome({
+      rescue,
+      plans: plans.value,
+      checkItems: checkItems.value,
+      rectifies: rectifies.value,
+    });
+    return {
+      outcome,
+      dueDate: reviewDueDate(rescue),
+      dueDays: reviewDueDays(rescue),
+      planDate: plan?.planDate ?? null,
+    };
+  }
+
+  /**
+   * 复盘登记整改：
+   * - 命中保养项且同项已有未复核单 → 复用该单（追加救援引用，不换限期）
+   * - 命中保养项但无待整改单 → 沿用保养项新建
+   * - 未命中 → 按救援原因新建（到场超时 / 救出超 1 小时限 3 日，其余 7 日）
+   */
+  async function registerReviewRectify(rescueId: string, reviewer: string): Promise<{
+    handleKind: RectifyHandleKind;
+    rectifyId: string;
+    message: string;
+  }> {
+    const rescue = rescues.value.find((item) => item.id === rescueId);
+    if (!rescue) throw new Error('未找到困人事件');
+    if (rescue.rectifyId) {
+      const linked = rectifies.value.find((row) => row.id === rescue.rectifyId);
+      if (linked) {
+        return {
+          handleKind: rescue.rectifyHandleKind ?? linked.handleKind,
+          rectifyId: linked.id,
+          message: '该事件已关联整改单，无需重复登记',
+        };
+      }
+    }
+    const { outcome } = resolveReviewOutcome({
+      rescue,
+      plans: plans.value,
+      checkItems: checkItems.value,
+      rectifies: rectifies.value,
+    });
+
+    if (outcome.kind === 'rescueReuse') {
+      const existing = rectifies.value.find((row) => row.id === outcome.rectifyId);
+      if (existing) {
+        const rescueIds = existing.rescueIds.includes(rescue.id)
+          ? existing.rescueIds
+          : [...existing.rescueIds, rescue.id];
+        await putRectify({
+          ...existing,
+          handleKind: 'rescueReuse',
+          rescueIds,
+          rescueId: existing.rescueId ?? rescue.id,
+        });
+        await putRescue({ ...rescue, rectifyId: existing.id, rectifyHandleKind: 'rescueReuse' });
+        emitChange();
+        return {
+          handleKind: 'rescueReuse',
+          rectifyId: existing.id,
+          message: `已复用未复核整改单「${existing.item}」，限期 ${existing.dueDate} 保持不变`,
+        };
+      }
+    }
+
+    if (outcome.kind === 'fromMaintenance') {
+      const dueDate = reviewDueDate(rescue);
+      const row: RectifyRow = {
+        id: uuid(),
+        elevatorId: rescue.elevatorId,
+        item: outcome.item,
+        dueDate,
+        state: 'pending',
+        reviewer: reviewer.trim(),
+        reviewedAt: null,
+        source: 'maintenance',
+        sourceNote: outcome.sourceNote,
+        handleKind: 'fromMaintenance',
+        rescueId: rescue.id,
+        rescueIds: [rescue.id],
+        createdAt: nowDateTime(),
+        revision: ROW_REVISION,
+      };
+      await putRectify(row);
+      await putRescue({ ...rescue, rectifyId: row.id, rectifyHandleKind: 'fromMaintenance' });
+      emitChange();
+      return {
+        handleKind: 'fromMaintenance',
+        rectifyId: row.id,
+        message: `已沿用最近保养异常项「${outcome.item}」登记整改，限期 ${dueDate}`,
+      };
+    }
+
+    const dueDate = reviewDueDate(rescue);
+    const row: RectifyRow = {
+      id: uuid(),
+      elevatorId: rescue.elevatorId,
+      item: outcome.item,
+      dueDate,
+      state: 'pending',
+      reviewer: reviewer.trim(),
+      reviewedAt: null,
+      source: 'rescue',
+      sourceNote: `困人复盘按原因登记 · ${rescue.cause}（${rescue.alarmAt}）`,
+      handleKind: 'fromRescueCause',
+      rescueId: rescue.id,
+      rescueIds: [rescue.id],
+      createdAt: nowDateTime(),
+      revision: ROW_REVISION,
+    };
+    await putRectify(row);
+    await putRescue({ ...rescue, rectifyId: row.id, rectifyHandleKind: 'fromRescueCause' });
+    emitChange();
+    return {
+      handleKind: 'fromRescueCause',
+      rectifyId: row.id,
+      message: `未匹配到最近保养异常项，已按救援原因「${outcome.item}」登记整改，限期 ${dueDate}`,
+    };
+  }
+
+  /** 处置方式文案（页面复用） */
+  function handleLabel(kind: RectifyHandleKind | null): string {
+    return kind ? RECTIFY_HANDLE_LABEL[kind] : '未登记整改';
+  }
+
   /** 困人事件视图：自动算到场与救援时长、时间线回放节点 */
   const rescueViews = computed<RescueView[]>(() =>
     rescues.value.map((rescue) => {
       const elevator = elevators.value.find((item) => item.id === rescue.elevatorId);
       const arrive = arriveMinutes(rescue.alarmAt, rescue.arriveAt);
       const total = rescueMinutes(rescue.alarmAt, rescue.rescueAt);
+      const linkedRow = rescue.rectifyId
+        ? rectifies.value.find((row) => row.id === rescue.rectifyId)
+        : undefined;
+      const linkedRectify: RescueLinkedRectify | null = linkedRow
+        ? {
+            id: linkedRow.id,
+            item: linkedRow.item,
+            dueDate: linkedRow.dueDate,
+            state: linkedRow.state,
+            sourceNote: linkedRow.sourceNote,
+            handleKind: linkedRow.handleKind,
+          }
+        : null;
       const timeline: RescueTimelineNode[] = [
         {
           label: '接警',
@@ -146,6 +330,7 @@ export const useRescueStore = defineStore('rescue', () => {
         rescueMinutes: total,
         arriveInTime: arrive > 0 && arrive <= ARRIVE_LIMIT_MINUTES,
         timeline,
+        linkedRectify,
       };
     }),
   );
@@ -206,6 +391,9 @@ export const useRescueStore = defineStore('rescue', () => {
   return {
     rescues,
     elevators,
+    plans,
+    checkItems,
+    rectifies,
     activeRescueId,
     loading,
     error,
@@ -216,6 +404,9 @@ export const useRescueStore = defineStore('rescue', () => {
     updateRescue,
     deleteRescue,
     setActive,
+    previewReview,
+    registerReviewRectify,
+    handleLabel,
     rescueViews,
     activeRescue,
     averageRescueMinutes,

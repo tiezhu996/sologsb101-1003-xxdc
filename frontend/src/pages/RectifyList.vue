@@ -33,6 +33,8 @@ import { useRectifyStore } from '../stores/rectifyStore';
 import { useElevatorStore } from '../stores/elevatorStore';
 import {
   RECTIFY_ITEM_LIBRARY,
+  RECTIFY_SOURCE_LABEL,
+  RECTIFY_HANDLE_LABEL,
   RECTIFY_STATE_LABEL,
   type RectifyDraft,
   type RectifyState,
@@ -86,7 +88,7 @@ const filtered = computed(() => {
     if (stateFilters.value.length > 0 && !stateFilters.value.includes(row.state)) return false;
     if (ownerFilters.value.length > 0 && !ownerFilters.value.includes(row.owner)) return false;
     if (overdueOnly.value && !row.overdue) return false;
-    if (lower && !`${row.elevatorName} ${row.item} ${row.reviewer}`.toLowerCase().includes(lower)) return false;
+    if (lower && !`${row.elevatorName} ${row.item} ${row.reviewer} ${row.sourceNote} ${RECTIFY_HANDLE_LABEL[row.handleKind]}`.toLowerCase().includes(lower)) return false;
     return true;
   });
 });
@@ -183,18 +185,69 @@ async function handleReset(): Promise<void> {
 }
 
 function exportOverdueCsv(): void {
-  const rows: Array<Array<string | number>> = [['电梯', '不合格项', '限期', '状态', '超期天数', '复核人']];
+  const rows: Array<Array<string | number>> = [
+    ['电梯', '不合格项', '来源', '处理方式', '来源说明', '限期', '状态', '超期天数', '复核人'],
+  ];
   for (const row of rectifyStore.rectifyViews) {
-    rows.push([row.elevatorName, row.item, row.dueDate, RECTIFY_STATE_LABEL[row.state], row.overdueDays, row.reviewer]);
+    rows.push([
+      row.elevatorName,
+      row.item,
+      RECTIFY_SOURCE_LABEL[row.source],
+      RECTIFY_HANDLE_LABEL[row.handleKind],
+      row.sourceNote,
+      row.dueDate,
+      RECTIFY_STATE_LABEL[row.state],
+      row.overdueDays,
+      row.reviewer,
+    ]);
   }
   downloadCsv(`gbelevsvc-rectify-${todayDate()}.csv`, rows);
   message.success('整改清单已导出 CSV');
 }
 
+const SOURCE_TAG_TYPE: Record<string, 'default' | 'info' | 'error'> = {
+  annual: 'default',
+  maintenance: 'info',
+  rescue: 'error',
+};
+
 const columns = computed<DataTableColumns<RectifyView>>(() => [
-  { title: '电梯', key: 'elevatorName', minWidth: 210, ellipsis: { tooltip: true } },
-  { title: '不合格项', key: 'item', minWidth: 180 },
-  { title: '限期', key: 'dueDate', width: 120 },
+  { title: '电梯', key: 'elevatorName', minWidth: 200, ellipsis: { tooltip: true } },
+  { title: '不合格项', key: 'item', minWidth: 160 },
+  {
+    title: '来源 / 处理',
+    key: 'source',
+    width: 210,
+    render: (row) =>
+      h(NSpace, { size: 4, vertical: true }, {
+        default: () => [
+          h(
+            NSpace,
+            { size: 6, align: 'center' },
+            {
+              default: () => [
+                h(
+                  NTag,
+                  { size: 'small', round: true, type: SOURCE_TAG_TYPE[row.source] ?? 'default' },
+                  { default: () => RECTIFY_SOURCE_LABEL[row.source] },
+                ),
+                h(
+                  NText,
+                  { depth: 3, style: 'font-size: 12px' },
+                  { default: () => RECTIFY_HANDLE_LABEL[row.handleKind] },
+                ),
+              ],
+            },
+          ),
+          h(
+            NText,
+            { depth: 3, style: 'font-size: 12px', ellipsis: { tooltip: true } },
+            { default: () => row.sourceNote || '—' },
+          ),
+        ],
+      }),
+  },
+  { title: '限期', key: 'dueDate', width: 110 },
   {
     title: '状态',
     key: 'state',
@@ -366,7 +419,7 @@ const columns = computed<DataTableColumns<RectifyView>>(() => [
             :data="filtered"
             :bordered="false"
             size="small"
-            :scroll-x="1160"
+            :scroll-x="1260"
             :pagination="{ pageSize: 9 }"
             :row-class-name="(row: RectifyView) => (row.overdue ? 'row-marked' : '')"
           />

@@ -5,6 +5,7 @@
  * 消费 Rescue、Elevator 与 <FilterBar>、<StatBadge>。
  */
 import { computed, h, onMounted, ref } from 'vue';
+import { useRouter } from 'vue-router';
 import {
   NButton,
   NCard,
@@ -31,12 +32,20 @@ import {
 } from 'naive-ui';
 import { useRescueStore } from '../stores/rescueStore';
 import { useElevatorStore } from '../stores/elevatorStore';
-import { ARRIVE_LIMIT_MINUTES, RESCUE_CAUSES, type RescueDraft, type RescueView } from '../types/rescue';
+import { ARRIVE_LIMIT_MINUTES, RESCUE_CAUSES, RESCUE_DURATION_LIMIT_MINUTES, type RescueDraft, type RescueView } from '../types/rescue';
+import {
+  RECTIFY_HANDLE_LABEL,
+  RECTIFY_STATE_LABEL,
+  type RectifyState,
+} from '../types/rectify';
 import { formatMinutes } from '../utils/duration';
+import { isUrgentRescue, urgentReasonText } from '../utils/rescueReview';
+import { ROUTES } from '../router';
 import StatBadge from '../components/common/StatBadge.vue';
 import EmptyPanel from '../components/common/EmptyPanel.vue';
 import FilterBar from '../components/common/FilterBar.vue';
 
+const router = useRouter();
 const message = useMessage();
 const rescueStore = useRescueStore();
 const elevatorStore = useElevatorStore();
@@ -192,6 +201,42 @@ async function submit(): Promise<void> {
   modalOpen.value = false;
 }
 
+/* ---------------------------- 复盘整改处理 ---------------------------- */
+const reviewReviewer = ref('王敏');
+
+const activePreview = computed(() =>
+  rescueStore.activeRescue ? rescueStore.previewReview(rescueStore.activeRescue.id) : null,
+);
+
+const activeUrgent = computed(() =>
+  rescueStore.activeRescue ? isUrgentRescue(rescueStore.activeRescue) : false,
+);
+
+const activeUrgentReason = computed(() =>
+  rescueStore.activeRescue ? urgentReasonText(rescueStore.activeRescue) : '',
+);
+
+const HANDLE_TAG_TYPE: Record<string, 'info' | 'warning' | 'success'> = {
+  fromMaintenance: 'warning',
+  rescueReuse: 'info',
+  fromRescueCause: 'warning',
+};
+
+async function registerReview(): Promise<void> {
+  const rescue = rescueStore.activeRescue;
+  if (!rescue) return;
+  const result = await rescueStore.registerReviewRectify(rescue.id, reviewReviewer.value);
+  if (result.handleKind === 'rescueReuse' && result.message.includes('无需重复')) {
+    message.info(result.message);
+  } else {
+    message.success(result.message);
+  }
+}
+
+function goRectifies(): void {
+  void router.push(ROUTES.rectifies);
+}
+
 const columns = computed<DataTableColumns<RescueView>>(() => [
   { title: '报警时间', key: 'alarmAt', width: 150 },
   { title: '电梯', key: 'elevatorName', minWidth: 200, ellipsis: { tooltip: true } },
@@ -213,8 +258,42 @@ const columns = computed<DataTableColumns<RescueView>>(() => [
     render: (row) => formatMinutes(row.rescueMinutes),
   },
   { title: '被困人数', key: 'trappedCount', width: 100 },
-  { title: '原因', key: 'cause', minWidth: 140 },
-  { title: '救援人', key: 'responder', width: 100 },
+  { title: '原因', key: 'cause', minWidth: 130 },
+  {
+    title: '整改处理',
+    key: 'linkedRectify',
+    width: 150,
+    render: (row) => {
+      if (!row.linkedRectify) {
+        return h(NTag, { size: 'small', round: true, type: 'warning' }, { default: () => '待登记整改' });
+      }
+      const stateType: Record<RectifyState, 'warning' | 'success'> = {
+        pending: 'warning',
+        reviewed: 'success',
+      };
+      return h(
+        NSpace,
+        { size: 4, vertical: true },
+        {
+          default: () => [
+            h(
+              NTag,
+              { size: 'small', type: HANDLE_TAG_TYPE[row.linkedRectify!.handleKind] ?? 'info', round: true },
+              { default: () => RECTIFY_HANDLE_LABEL[row.linkedRectify!.handleKind] },
+            ),
+            h(
+              NTag,
+              { size: 'small', type: stateType[row.linkedRectify!.state] },
+              {
+                default: () => `${RECTIFY_STATE_LABEL[row.linkedRectify!.state]} · ${row.linkedRectify!.dueDate}`,
+              },
+            ),
+          ],
+        },
+      );
+    },
+  },
+  { title: '救援人', key: 'responder', width: 90 },
   {
     title: '操作',
     key: 'actions',
@@ -320,7 +399,7 @@ const columns = computed<DataTableColumns<RescueView>>(() => [
             :data="filtered"
             :bordered="false"
             size="small"
-            :scroll-x="1130"
+            :scroll-x="1280"
             :pagination="{ pageSize: 8 }"
             :row-class-name="(row: RescueView) => (!row.arriveInTime ? 'row-marked' : '')"
           />
@@ -361,6 +440,74 @@ const columns = computed<DataTableColumns<RescueView>>(() => [
                 :content="`${node.minutesFromAlarm === 0 ? '报警起点' : `距报警 ${formatMinutes(node.minutesFromAlarm)}`} · ${node.detail}`"
               />
             </n-timeline>
+
+            <div class="review-panel">
+              <n-space justify="space-between" align="center">
+                <n-text strong style="font-size: 13px">复盘整改处理</n-text>
+                <n-tag v-if="rescueStore.activeRescue.linkedRectify" size="small" round :type="rescueStore.activeRescue.linkedRectify.state === 'reviewed' ? 'success' : 'warning'">
+                  {{ RECTIFY_STATE_LABEL[rescueStore.activeRescue.linkedRectify.state] }}
+                </n-tag>
+              </n-space>
+
+              <!-- 已关联：展示来源与处理 -->
+              <template v-if="rescueStore.activeRescue.linkedRectify">
+                <n-descriptions :column="1" size="small" label-placement="left" bordered style="margin-top: 8px">
+                  <n-descriptions-item label="处理方式">
+                    {{ RECTIFY_HANDLE_LABEL[rescueStore.activeRescue.linkedRectify.handleKind] }}
+                  </n-descriptions-item>
+                  <n-descriptions-item label="整改项">{{ rescueStore.activeRescue.linkedRectify.item }}</n-descriptions-item>
+                  <n-descriptions-item label="来源">{{ rescueStore.activeRescue.linkedRectify.sourceNote || '—' }}</n-descriptions-item>
+                  <n-descriptions-item label="限期">{{ rescueStore.activeRescue.linkedRectify.dueDate }}</n-descriptions-item>
+                </n-descriptions>
+                <n-button size="small" text type="primary" style="margin-top: 6px" @click="goRectifies">
+                  前往整改页查看
+                </n-button>
+              </template>
+
+              <!-- 未关联：按规则预演并提供登记 -->
+              <template v-else-if="activePreview">
+                <n-descriptions :column="1" size="small" label-placement="left" bordered style="margin-top: 8px">
+                  <n-descriptions-item label="最近已签署计划">
+                    {{ activePreview.planDate ? `${activePreview.planDate}（${activePreview.outcome.kind === 'fromRescueCause' ? '无对应异常 / 建议项' : '命中异常 / 建议项'}）` : '该电梯暂无已签署计划' }}
+                  </n-descriptions-item>
+                  <n-descriptions-item label="建议处理">
+                    {{ RECTIFY_HANDLE_LABEL[activePreview.outcome.kind] }}
+                  </n-descriptions-item>
+                  <n-descriptions-item label="整改项">
+                    <n-tag
+                      size="small"
+                      round
+                      :type="activePreview.outcome.kind === 'fromRescueCause' ? 'default' : 'warning'"
+                    >
+                      {{ activePreview.outcome.item }}
+                    </n-tag>
+                    <n-text v-if="activePreview.outcome.kind === 'rescueReuse'" depth="3" style="margin-left: 6px; font-size: 12px">
+                      复用未复核单，限期不更换
+                    </n-text>
+                  </n-descriptions-item>
+                  <n-descriptions-item label="整改限期">
+                    <n-tag size="small" round :type="activeUrgent ? 'error' : 'info'">
+                      {{ activeUrgent ? `加急 ${activePreview.dueDays} 日` : `${activePreview.dueDays} 日` }}
+                      （{{ activePreview.dueDate }}）
+                    </n-tag>
+                    <n-text depth="3" style="margin-left: 6px; font-size: 12px">
+                      {{
+                        activeUrgent
+                          ? `${activeUrgentReason}，限期三日`
+                          : `到场 ≤ ${ARRIVE_LIMIT_MINUTES} 分钟且救出 ≤ ${RESCUE_DURATION_LIMIT_MINUTES / 60} 小时，限期七日`
+                      }}
+                    </n-text>
+                  </n-descriptions-item>
+                </n-descriptions>
+                <n-space style="margin-top: 10px" align="center">
+                  <n-text depth="3" style="font-size: 12px">复核人</n-text>
+                  <n-input v-model:value="reviewReviewer" size="small" placeholder="复核人" style="width: 130px" />
+                  <n-button size="small" type="primary" @click="registerReview">
+                    {{ activePreview.outcome.kind === 'rescueReuse' ? '复用该待整改单' : '登记整改单' }}
+                  </n-button>
+                </n-space>
+              </template>
+            </div>
           </template>
           <n-text v-else depth="3">点击左侧事件行的「复盘」查看完整时间线</n-text>
         </n-card>
@@ -440,3 +587,11 @@ const columns = computed<DataTableColumns<RescueView>>(() => [
     </n-modal>
   </div>
 </template>
+
+<style scoped>
+.review-panel {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--n-border-color, #e0e0e6);
+}
+</style>

@@ -20,7 +20,7 @@ import { nowDateTime, rescueMinutes, todayDate } from './duration';
 export const DB_NAME = 'gbelevsvc';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -88,6 +88,33 @@ class ElevatorServiceDatabase extends Dexie {
           if (row.result === undefined) row.result = null;
         });
       });
+
+    // v3：整改单补充来源（source / sourceNote / handleKind）与困人事件关联
+    //     （rescueId / rescueIds），困人事件回写复盘整改单（rectifyId / rectifyHandleKind）
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        elevators: 'id, regCode, owner, maintCycle, useDate',
+        plans: 'id, elevatorId, cycleType, state, planDate, executor, [elevatorId+planDate]',
+        checkItems: 'id, planId, seq, result, itemName, [planId+seq]',
+        rescues: 'id, elevatorId, alarmAt, responder',
+        rectifies: 'id, elevatorId, state, dueDate, reviewer, source, rescueId',
+        settings: 'id',
+      })
+      .upgrade(async (tx) => {
+        await tx.table('rectifies').toCollection().modify((row: Record<string, unknown>) => {
+          if (typeof row.source !== 'string') row.source = 'annual';
+          if (typeof row.sourceNote !== 'string') row.sourceNote = '历史整改单（v3 迁移补登）';
+          if (typeof row.handleKind !== 'string') row.handleKind = 'manual';
+          if (typeof row.rescueId !== 'string') row.rescueId = null;
+          if (!Array.isArray(row.rescueIds)) row.rescueIds = [];
+          row.revision = ROW_REVISION;
+        });
+        await tx.table('rescues').toCollection().modify((row: Record<string, unknown>) => {
+          if (typeof row.rectifyId !== 'string') row.rectifyId = null;
+          if (typeof row.rectifyHandleKind !== 'string') row.rectifyHandleKind = null;
+          row.revision = ROW_REVISION;
+        });
+      });
   }
 }
 
@@ -121,8 +148,19 @@ interface SeedElevatorSpec {
     cause: string;
     trappedCount: number;
     responder: string;
+    /** 复盘关联整改单序号（spec.rectifies 的 1 基序号），用于演示沿用 / 复用 */
+    linkedRectify?: number;
+    linkedHandle?: Rectify['handleKind'];
   }>;
-  rectifies: Array<{ item: string; dueOffsetDays: number; state: Rectify['state']; reviewer: string }>;
+  rectifies: Array<{
+    item: string;
+    dueOffsetDays: number;
+    state: Rectify['state'];
+    reviewer: string;
+    source?: Rectify['source'];
+    sourceNote?: string;
+    handleKind?: Rectify['handleKind'];
+  }>;
 }
 
 const SEED_ELEVATORS: SeedElevatorSpec[] = [
@@ -134,8 +172,8 @@ const SEED_ELEVATORS: SeedElevatorSpec[] = [
     useDate: '2021-08-16',
     maintCycle: 'halfMonth',
     plans: [
-      { cycleType: 'halfMonth', offsetDays: -22, executor: '刘建国', state: 'signed', abnormalSeq: [], adviceSeq: [] },
-      { cycleType: 'halfMonth', offsetDays: -7, executor: '刘建国', state: 'signed', abnormalSeq: [3], adviceSeq: [] },
+      { cycleType: 'halfMonth', offsetDays: -22, executor: '刘建国', state: 'signed', abnormalSeq: [2], adviceSeq: [] },
+      { cycleType: 'halfMonth', offsetDays: -7, executor: '刘建国', state: 'signed', abnormalSeq: [1], adviceSeq: [] },
       { cycleType: 'halfMonth', offsetDays: 6, executor: '张海涛', state: 'executing', abnormalSeq: [], adviceSeq: [] },
       { cycleType: 'quarter', offsetDays: -35, executor: '张海涛', state: 'signed', abnormalSeq: [], adviceSeq: [7] },
     ],
@@ -148,6 +186,8 @@ const SEED_ELEVATORS: SeedElevatorSpec[] = [
         cause: '门锁回路故障',
         trappedCount: 2,
         responder: '刘建国',
+        linkedRectify: 1,
+        linkedHandle: 'rescueReuse',
       },
       {
         offsetDays: -3,
@@ -160,7 +200,15 @@ const SEED_ELEVATORS: SeedElevatorSpec[] = [
       },
     ],
     rectifies: [
-      { item: '层门门锁啮合深度不足', dueOffsetDays: -5, state: 'pending', reviewer: '王敏' },
+      {
+        item: '层门锁紧装置',
+        dueOffsetDays: -5,
+        state: 'pending',
+        reviewer: '王敏',
+        source: 'maintenance',
+        sourceNote: '半月保养异常项转单 · 层门锁紧装置',
+        handleKind: 'maintenancePromote',
+      },
       { item: '轿厢应急照明失效', dueOffsetDays: 12, state: 'pending', reviewer: '王敏' },
     ],
   },
@@ -186,9 +234,29 @@ const SEED_ELEVATORS: SeedElevatorSpec[] = [
         trappedCount: 3,
         responder: '陈志远',
       },
+      {
+        offsetDays: -150,
+        alarmHour: 10,
+        arriveLagMinutes: 40,
+        rescueLagMinutes: 75,
+        cause: '钢丝绳打滑',
+        trappedCount: 4,
+        responder: '陈志远',
+        linkedRectify: 2,
+        linkedHandle: 'fromMaintenance',
+      },
     ],
     rectifies: [
       { item: '制动器制动力矩不足', dueOffsetDays: 8, state: 'pending', reviewer: '王敏' },
+      {
+        item: '钢丝绳磨损',
+        dueOffsetDays: -147,
+        state: 'reviewed',
+        reviewer: '王敏',
+        source: 'maintenance',
+        sourceNote: '年度保养异常项 · 钢丝绳磨损（困人复盘沿用）',
+        handleKind: 'fromMaintenance',
+      },
     ],
   },
   {
@@ -301,6 +369,10 @@ async function seedDatabase(): Promise<void> {
       const rescueAt = `${date} ${String(
         rescueSpec.alarmHour + Math.floor((5 + rescueSpec.rescueLagMinutes) / 60),
       ).padStart(2, '0')}:${String((5 + rescueSpec.rescueLagMinutes) % 60).padStart(2, '0')}`;
+      const linkedId =
+        rescueSpec.linkedRectify !== undefined
+          ? `rect-${elevatorIndex + 1}-${rescueSpec.linkedRectify}`
+          : null;
       rescues.push({
         id: `rescue-${elevatorIndex + 1}-${rescueIndex + 1}`,
         elevatorId,
@@ -310,20 +382,32 @@ async function seedDatabase(): Promise<void> {
         cause: rescueSpec.cause,
         trappedCount: rescueSpec.trappedCount,
         responder: rescueSpec.responder,
+        rectifyId: linkedId,
+        rectifyHandleKind: rescueSpec.linkedHandle ?? null,
         createdAt: stamp,
         revision: ROW_REVISION,
       });
     });
 
     spec.rectifies.forEach((rectifySpec, rectifyIndex) => {
+      const rectifyId = `rect-${elevatorIndex + 1}-${rectifyIndex + 1}`;
+      const linkedRescueIndex = spec.rescues.findIndex(
+        (rescueSpec) => rescueSpec.linkedRectify === rectifyIndex + 1,
+      );
+      const linkedRescueId = linkedRescueIndex >= 0 ? `rescue-${elevatorIndex + 1}-${linkedRescueIndex + 1}` : null;
       rectifies.push({
-        id: `rect-${elevatorIndex + 1}-${rectifyIndex + 1}`,
+        id: rectifyId,
         elevatorId,
         item: rectifySpec.item,
         dueDate: addDays(todayDate(), rectifySpec.dueOffsetDays),
         state: rectifySpec.state,
         reviewer: rectifySpec.reviewer,
         reviewedAt: rectifySpec.state === 'reviewed' ? `${addDays(todayDate(), -3)} 10:30` : null,
+        source: rectifySpec.source ?? 'annual',
+        sourceNote: rectifySpec.sourceNote ?? '年检登记',
+        handleKind: rectifySpec.handleKind ?? 'manual',
+        rescueId: linkedRescueId,
+        rescueIds: linkedRescueId ? [linkedRescueId] : [],
         createdAt: stamp,
         revision: ROW_REVISION,
       });
@@ -509,8 +593,23 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
       await db.elevators.bulkPut(snapshot.elevators ?? []);
       await db.plans.bulkPut(snapshot.plans ?? []);
       await db.checkItems.bulkPut(snapshot.checkItems ?? []);
-      await db.rescues.bulkPut(snapshot.rescues ?? []);
-      await db.rectifies.bulkPut(snapshot.rectifies ?? []);
+      await db.rescues.bulkPut(
+        (snapshot.rescues ?? []).map((row) => ({
+          ...row,
+          rectifyId: typeof row.rectifyId === 'string' ? row.rectifyId : null,
+          rectifyHandleKind: typeof row.rectifyHandleKind === 'string' ? row.rectifyHandleKind : null,
+        })),
+      );
+      await db.rectifies.bulkPut(
+        (snapshot.rectifies ?? []).map((row) => ({
+          ...row,
+          source: typeof row.source === 'string' ? row.source : 'annual',
+          sourceNote: typeof row.sourceNote === 'string' ? row.sourceNote : '导入历史整改单',
+          handleKind: typeof row.handleKind === 'string' ? row.handleKind : 'manual',
+          rescueId: typeof row.rescueId === 'string' ? row.rescueId : null,
+          rescueIds: Array.isArray(row.rescueIds) ? row.rescueIds : [],
+        })),
+      );
     },
   );
 }

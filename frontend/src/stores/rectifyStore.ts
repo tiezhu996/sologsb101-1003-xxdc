@@ -10,14 +10,18 @@ import {
   listRectifies,
   putRectify,
   listCheckItems,
+  listRescues,
   removeRectify,
   type CheckItemRow,
   type ElevatorRow,
   type RectifyRow,
+  type RescueRow,
 } from '../utils/db';
 import {
   overdueDaysOf,
   type RectifyDraft,
+  type RectifySource,
+  type RectifyHandleKind,
   type RectifyView,
 } from '../types/rectify';
 import { nowDateTime } from '../utils/duration';
@@ -27,6 +31,7 @@ import { emitChange, onChange } from '../utils/events';
 export const useRectifyStore = defineStore('rectify', () => {
   const rectifies = ref<RectifyRow[]>([]);
   const elevators = ref<ElevatorRow[]>([]);
+  const rescues = ref<RescueRow[]>([]);
   const loading = ref(false);
   const error = ref('');
   const initialized = ref(false);
@@ -35,9 +40,14 @@ export const useRectifyStore = defineStore('rectify', () => {
   async function load(): Promise<void> {
     loading.value = true;
     try {
-      const [rectifyRows, elevatorRows] = await Promise.all([listRectifies(), listElevators()]);
+      const [rectifyRows, elevatorRows, rescueRows] = await Promise.all([
+        listRectifies(),
+        listElevators(),
+        listRescues(),
+      ]);
       rectifies.value = rectifyRows;
       elevators.value = elevatorRows;
+      rescues.value = rescueRows;
       error.value = '';
     } catch (cause) {
       error.value = cause instanceof Error ? cause.message : '整改单读取失败';
@@ -58,6 +68,8 @@ export const useRectifyStore = defineStore('rectify', () => {
   }
 
   async function createRectify(draft: RectifyDraft): Promise<RectifyRow> {
+    const source: RectifySource = draft.source ?? 'annual';
+    const handleKind: RectifyHandleKind = draft.handleKind ?? 'manual';
     const row: RectifyRow = {
       id: uuid(),
       elevatorId: draft.elevatorId,
@@ -66,6 +78,11 @@ export const useRectifyStore = defineStore('rectify', () => {
       state: 'pending',
       reviewer: draft.reviewer.trim(),
       reviewedAt: null,
+      source,
+      sourceNote: draft.sourceNote?.trim() || '',
+      handleKind,
+      rescueId: draft.rescueId ?? null,
+      rescueIds: draft.rescueId ? [draft.rescueId] : [],
       createdAt: nowDateTime(),
       revision: ROW_REVISION,
     };
@@ -133,7 +150,15 @@ export const useRectifyStore = defineStore('rectify', () => {
         (row) => row.elevatorId === elevatorId && row.item === item.itemName && row.state === 'pending',
       );
       if (exists) continue;
-      await createRectify({ elevatorId, item: item.itemName, dueDate, reviewer });
+      await createRectify({
+        elevatorId,
+        item: item.itemName,
+        dueDate,
+        reviewer,
+        source: 'maintenance',
+        sourceNote: `保养异常项转单 · ${item.itemName}`,
+        handleKind: 'maintenancePromote',
+      });
       created += 1;
     }
     return created;
@@ -144,12 +169,14 @@ export const useRectifyStore = defineStore('rectify', () => {
     rectifies.value.map((row) => {
       const elevator = elevators.value.find((item) => item.id === row.elevatorId);
       const days = overdueDaysOf(row.dueDate, row.state);
+      const rescue = rescues.value.find((item) => item.id === row.rescueId);
       return {
         ...row,
         elevatorName: elevator ? `${elevator.regCode}（${elevator.owner}）` : '已删除电梯',
         owner: elevator?.owner ?? '-',
         overdue: days > 0,
         overdueDays: days,
+        rescueAlarmAt: rescue?.alarmAt ?? null,
       };
     }),
   );
@@ -183,6 +210,7 @@ export const useRectifyStore = defineStore('rectify', () => {
   return {
     rectifies,
     elevators,
+    rescues,
     loading,
     error,
     initialized,
